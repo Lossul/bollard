@@ -1,0 +1,35 @@
+{
+  "seed": 20260905,
+  "test_fraction": 0.2,
+  "train_fraction_of_rest": 0.8,
+  "n_total": 300,
+  "n_train": 192,
+  "n_dev": 48,
+  "n_test": 60,
+  "counts_by_continent": {
+    "train": {
+      "Africa": 33,
+      "Asia": 30,
+      "Europe": 31,
+      "North America": 37,
+      "Oceania": 32,
+      "South America": 29
+    },
+    "dev": {
+      "Africa": 7,
+      "Asia": 10,
+      "Europe": 9,
+      "North America": 3,
+      "Oceania": 8,
+      "South America": 11
+    },
+    "test": {
+      "Africa": 10,
+      "Asia": 10,
+      "Europe": 10,
+      "North America": 10,
+      "Oceania": 10,
+      "South America": 10
+    }
+  }
+}
