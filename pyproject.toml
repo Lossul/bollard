@@ -1,0 +1,22 @@
+[project]
+name = "bollard"
+version = "0.1.0"
+description = "An agent that geolocates street-level photos and defends its reasoning, scored against ground truth."
+authors = [
+    { name = "Pranjal Shrvastava", email = "pshriv365@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=1.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

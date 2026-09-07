@@ -1,0 +1,14 @@
+.env
+.venv
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# runs/ holds the sqlite db and raw trace blobs, never checked in
+runs/*
+!runs/.gitkeep
+
+# data/ holds the image manifest (tracked) but not the images themselves
+data/*.jpg
+data/*.jpeg
+data/*.png
