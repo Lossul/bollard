@@ -57,7 +57,7 @@ def load_run_meta(conn: sqlite3.Connection, run_id: str) -> dict | None:
     return dict(zip(["run_id", "split", "model", "prompt_version", "n_total"], row))
 
 
-def load_predictions(conn: sqlite3.Connection, run_id: str) -> tuple[list[Prediction], int]:
+def load_true_countries_for_run(conn: sqlite3.Connection, run_id: str) -> dict[str, str]:
     # A run's own `split` label (e.g. "train+dev") isn't a lookup key -- read
     # each row's actual originating split instead and merge their ground truth.
     # Splits partition the manifest with no overlapping image_ids, so merging
@@ -68,6 +68,11 @@ def load_predictions(conn: sqlite3.Connection, run_id: str) -> tuple[list[Predic
     true_countries: dict[str, str] = {}
     for split in row_splits:
         true_countries.update(load_true_countries(split))
+    return true_countries
+
+
+def load_predictions(conn: sqlite3.Connection, run_id: str) -> tuple[list[Prediction], int]:
+    true_countries = load_true_countries_for_run(conn, run_id)
 
     rows = conn.execute(
         "SELECT image_id, status, pred_lat, pred_lon, true_lat, true_lon, pred_country, continent "

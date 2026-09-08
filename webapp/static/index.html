@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bollard playground</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #fff; --border: #dfe3e8; --text: #1c2126; --muted: #667085;
+    --accent: #2f5fd6; --ok: #1a7f4e; --fail: #b3261e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header { padding: 16px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  h1 { margin: 0 0 2px; font-size: 18px; }
+  .sub { color: var(--muted); font-size: 12.5px; }
+  main { max-width: 920px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 9px 16px; font-size: 13.5px; cursor: pointer;
+  }
+  button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #image-wrap { text-align: center; }
+  #image-wrap img { max-width: 100%; max-height: 480px; border-radius: 8px; }
+  #guess-map-wrap { position: relative; display: block; width: 100%; line-height: 0; cursor: crosshair; }
+  #guess-map-wrap img { width: 100%; display: block; border-radius: 8px; }
+  #guess-pin {
+    position: absolute; width: 14px; height: 14px; margin-left: -8px; margin-top: -8px;
+    background: var(--accent); border: 2px solid #fff; border-radius: 50%;
+    box-shadow: 0 1px 3px rgba(0,0,0,.5); pointer-events: none;
+  }
+  #guess-pin[hidden] { display: none; }
+  .map-credit { font-size: 11px; color: var(--muted); margin-top: 6px; text-align: right; }
+  #guess-coords { font-size: 12.5px; color: var(--muted); }
+  .guess-hint { margin-bottom: 8px; }
+  #map { height: 360px; border-radius: 8px; margin-bottom: 10px; display: none; }
+  #results { display: none; }
+  #results.visible { display: block; }
+  #results.visible #map { display: block; }
+  #results-text p { margin: 6px 0; }
+  #results-text .error { color: var(--fail); }
+  #results-text ul { margin: 8px 0; padding-left: 18px; }
+  #results-text .reasoning { color: var(--muted); font-style: italic; }
+  #status-line { color: var(--muted); font-size: 12px; }
+  #error-line { color: var(--fail); font-size: 13px; min-height: 1.2em; }
+  #placeholder { color: var(--muted); text-align: center; padding: 40px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>bollard playground</h1>
+  <div class="sub">Guess where a street photo was taken. Compare your guess against the agent's, against the truth.</div>
+</header>
+<main>
+  <div class="panel controls">
+    <button id="random-btn">Random round</button>
+    <button class="secondary" id="upload-btn">Upload a photo</button>
+    <input type="file" id="upload-input" accept="image/*" hidden>
+    <span id="status-line"></span>
+  </div>
+
+  <div id="error-line"></div>
+
+  <div class="panel" id="image-panel">
+    <div id="placeholder">Start a round to see a photo.</div>
+    <div id="image-wrap" hidden><img id="round-image" alt="street scene"></div>
+  </div>
+
+  <div class="panel">
+    <div class="sub guess-hint">Click the map where you think the photo was taken.</div>
+    <div id="guess-map-wrap">
+      <img id="guess-map" src="/static/world_map.jpg" alt="World map -- click to place your guess">
+      <div id="guess-pin" hidden></div>
+    </div>
+    <div class="map-credit">Map: Strebe, CC BY-SA 3.0, via Wikimedia Commons</div>
+  </div>
+
+  <div class="panel controls">
+    <span id="guess-coords">no guess placed yet</span>
+    <button id="reveal-btn" disabled>Reveal</button>
+  </div>
+
+  <div class="panel" id="results">
+    <div id="map"></div>
+    <div id="results-text"></div>
+  </div>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const randomBtn = document.getElementById("random-btn");
+  const uploadBtn = document.getElementById("upload-btn");
+  const uploadInput = document.getElementById("upload-input");
+  const statusLine = document.getElementById("status-line");
+  const errorLine = document.getElementById("error-line");
+  const placeholder = document.getElementById("placeholder");
+  const imageWrap = document.getElementById("image-wrap");
+  const roundImage = document.getElementById("round-image");
+  const guessMapWrap = document.getElementById("guess-map-wrap");
+  const guessMap = document.getElementById("guess-map");
+  const guessPin = document.getElementById("guess-pin");
+  const guessCoords = document.getElementById("guess-coords");
+  const revealBtn = document.getElementById("reveal-btn");
+  const resultsEl = document.getElementById("results");
+  const resultsTextEl = document.getElementById("results-text");
+
+  let currentRound = null;
+  let userGuess = null; // {lat, lon}
+  let map = null;
+  let mapMarkers = [];
+
+  function esc(s) {
+    if (s === null || s === undefined) return "";
+    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // Static map is a plain equirectangular projection: pixel fraction maps
+  // linearly onto lon in [-180, 180] and lat in [90, -90].
+  guessMapWrap.addEventListener("click", (e) => {
+    if (!currentRound) return;
+    const rect = guessMap.getBoundingClientRect();
+    const fracX = (e.clientX - rect.left) / rect.width;
+    const fracY = (e.clientY - rect.top) / rect.height;
+    const lat = 90 - fracY * 180;
+    const lon = fracX * 360 - 180;
+
+    userGuess = { lat, lon };
+    guessPin.style.left = `${fracX * 100}%`;
+    guessPin.style.top = `${fracY * 100}%`;
+    guessPin.hidden = false;
+    guessCoords.textContent = `your guess: ${lat.toFixed(2)}, ${lon.toFixed(2)}`;
+    revealBtn.disabled = false;
+  });
+
+  function showError(msg) {
+    errorLine.textContent = msg || "";
+  }
+
+  function setLoading(loading) {
+    randomBtn.disabled = loading;
+    uploadBtn.disabled = loading;
+    statusLine.textContent = loading ? "asking the agent..." : statusLine.textContent;
+  }
+
+  async function refreshStatus() {
+    try {
+      const res = await fetch("/api/status");
+      const data = await res.json();
+      statusLine.textContent = `${data.used_today}/${data.daily_limit} predictions used today`;
+    } catch (e) {
+      statusLine.textContent = "";
+    }
+  }
+
+  function onRoundLoaded(round) {
+    currentRound = round;
+    placeholder.hidden = true;
+    imageWrap.hidden = false;
+    roundImage.src = round.image_data_url;
+    userGuess = null;
+    guessPin.hidden = true;
+    guessCoords.textContent = "no guess placed yet";
+    revealBtn.disabled = true;
+    resultsEl.classList.remove("visible");
+    resultsTextEl.innerHTML = "";
+    clearMap();
+    showError("");
+    refreshStatus();
+  }
+
+  async function handleResponse(res) {
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        detail = (await res.json()).detail || detail;
+      } catch (e) {}
+      throw new Error(detail);
+    }
+    return res.json();
+  }
+
+  randomBtn.addEventListener("click", async () => {
+    setLoading(true);
+    showError("");
+    try {
+      const round = await fetch("/api/predict/random", { method: "POST" }).then(handleResponse);
+      onRoundLoaded(round);
+    } catch (e) {
+      showError(e.message);
+    }
+    setLoading(false);
+  });
+
+  uploadBtn.addEventListener("click", () => uploadInput.click());
+
+  uploadInput.addEventListener("change", async () => {
+    const file = uploadInput.files[0];
+    if (!file) return;
+    setLoading(true);
+    showError("");
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const round = await fetch("/api/predict/upload", { method: "POST", body: form }).then(handleResponse);
+      onRoundLoaded(round);
+    } catch (e) {
+      showError(e.message);
+    }
+    setLoading(false);
+    uploadInput.value = "";
+  });
+
+  function ensureMap() {
+    if (!map) {
+      map = L.map("map");
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "&copy; OpenStreetMap contributors",
+        maxZoom: 19,
+      }).addTo(map);
+    }
+    return map;
+  }
+
+  function clearMap() {
+    mapMarkers.forEach(m => m.remove());
+    mapMarkers = [];
+  }
+
+  function renderMap(userLat, userLon, round) {
+    document.getElementById("map").style.display = "block";
+    const m = ensureMap();
+    setTimeout(() => m.invalidateSize(), 0);
+    clearMap();
+
+    const points = [[userLat, userLon]];
+    mapMarkers.push(L.marker([userLat, userLon]).bindPopup("Your guess").addTo(m));
+
+    if (round.agent.status === "ok") {
+      points.push([round.agent.lat, round.agent.lon]);
+      mapMarkers.push(
+        L.circleMarker([round.agent.lat, round.agent.lon], { color: "#b3261e", radius: 9, fillOpacity: 0.8 })
+          .bindPopup("Agent guess" + (round.agent.country ? ` (${esc(round.agent.country)})` : ""))
+          .addTo(m)
+      );
+    }
+
+    if (round.true_lat !== null) {
+      points.push([round.true_lat, round.true_lon]);
+      mapMarkers.push(
+        L.circleMarker([round.true_lat, round.true_lon], { color: "#1a7f4e", radius: 9, fillOpacity: 0.8 })
+          .bindPopup("Ground truth")
+          .addTo(m)
+      );
+    }
+
+    m.fitBounds(points, { padding: [40, 40], maxZoom: 12 });
+  }
+
+  function renderResults(userLat, userLon, round, scores) {
+    const agent = round.agent;
+    const hasTruth = round.true_lat !== null;
+    let html = "";
+
+    if (agent.status === "ok") {
+      if (hasTruth) {
+        html += `<p><b>You:</b> ${scores.user_vs_truth_km.toFixed(1)} km from the truth</p>`;
+        html += `<p><b>Agent:</b> ${scores.agent_vs_truth_km.toFixed(1)} km from the truth`;
+        html += scores.user_vs_truth_km < scores.agent_vs_truth_km ? " &mdash; you win this round" : " &mdash; agent wins this round";
+        html += `</p>`;
+      } else {
+        html += `<p>No ground truth for an uploaded photo. You and the agent are ${scores.user_vs_agent_km.toFixed(1)} km apart.</p>`;
+      }
+      html += `<p><b>Agent country:</b> ${esc(agent.country) || "&mdash;"} &middot; <b>confidence:</b> ${agent.confidence ?? "&mdash;"}</p>`;
+      if (agent.reasoning) html += `<p class="reasoning">${esc(agent.reasoning)}</p>`;
+      if (Array.isArray(agent.evidence) && agent.evidence.length) {
+        html += "<ul>" + agent.evidence.map(e =>
+          `<li><b>${esc(e.cue)}</b> <i>(${esc(e.weight)})</i>: ${esc(e.observation)}</li>`
+        ).join("") + "</ul>";
+      }
+    } else {
+      html += `<p class="error">Agent prediction failed: ${esc(agent.error)}</p>`;
+      if (hasTruth) {
+        html += `<p><b>You:</b> ${scores.user_vs_truth_km.toFixed(1)} km from the truth</p>`;
+      }
+    }
+
+    resultsTextEl.innerHTML = html;
+    resultsEl.classList.add("visible");
+    renderMap(userLat, userLon, round);
+  }
+
+  revealBtn.addEventListener("click", async () => {
+    if (!currentRound || !userGuess) return;
+    showError("");
+    revealBtn.disabled = true;
+    try {
+      const agent = currentRound.agent;
+      const scores = await fetch("/api/score", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_lat: userGuess.lat,
+          user_lon: userGuess.lon,
+          true_lat: currentRound.true_lat,
+          true_lon: currentRound.true_lon,
+          agent_lat: agent.status === "ok" ? agent.lat : null,
+          agent_lon: agent.status === "ok" ? agent.lon : null,
+        }),
+      }).then(handleResponse);
+      renderResults(userGuess.lat, userGuess.lon, currentRound, scores);
+    } catch (e) {
+      showError(e.message);
+      revealBtn.disabled = false;
+    }
+  });
+
+  refreshStatus();
+</script>
+</body>
+</html>

@@ -31,6 +31,7 @@ from pathlib import Path
 
 import anthropic
 
+from agent.image_utils import crop_bottom, strip_exif
 from agent.store import connect, finish_run, insert_prediction, insert_run
 
 MODEL = "claude-sonnet-5"
@@ -81,7 +82,17 @@ def fetch_image_base64(image_url: str) -> str:
     # Anthropic's URL image source respects the target host's robots.txt, which
     # blocks Mapillary's CDN -- so fetch the bytes ourselves and send base64 instead.
     with urllib.request.urlopen(image_url, timeout=30) as response:
-        return base64.standard_b64encode(response.read()).decode("utf-8")
+        image_bytes = response.read()
+    # The model must never see embedded ground-truth metadata. Most Mapillary
+    # thumbnails carry no EXIF at all, but it isn't consistent -- strip whatever's
+    # there regardless rather than trusting that to hold.
+    image_bytes = strip_exif(image_bytes)
+    # Some Mapillary images are dash-mounted and show a vehicle dashboard/hood
+    # at the bottom of frame (confirmed in a spot-check); crop it uniformly
+    # since it isn't detected per-image. Applies to what the model sees and,
+    # via the webapp reusing this same function, to what the user sees too.
+    image_bytes = crop_bottom(image_bytes)
+    return base64.standard_b64encode(image_bytes).decode("utf-8")
 
 
 def parse_prediction_json(text: str) -> dict:
@@ -105,11 +116,21 @@ class PredictionParseError(Exception):
         self.raw_response = raw_response
 
 
-def predict_one(client: anthropic.Anthropic, mapillary_token: str, prompt_text: str, row: dict) -> dict:
-    """Run one image through the model. Raises on any failure -- caller logs it."""
-    image_url = fetch_thumbnail_url(row["image_id"], mapillary_token)
-    image_b64 = fetch_image_base64(image_url)
+def fetch_and_encode_image(image_id: str, mapillary_token: str) -> str:
+    """Fetch a Mapillary image's thumbnail and return it EXIF-stripped, base64-encoded."""
+    image_url = fetch_thumbnail_url(image_id, mapillary_token)
+    return fetch_image_base64(image_url)
 
+
+def call_model(
+    client: anthropic.Anthropic, prompt_text: str, image_b64: str, media_type: str = "image/jpeg"
+) -> dict:
+    """Send an already-encoded image to the model and parse its response.
+
+    Returns evidence as a plain list (not pre-serialized) -- callers that need
+    it as TEXT for SQLite storage (see predict_one) serialize it themselves.
+    Raises PredictionParseError (carrying the raw text) if parsing fails.
+    """
     response = client.messages.create(
         model=MODEL,
         max_tokens=1024,
@@ -121,7 +142,7 @@ def predict_one(client: anthropic.Anthropic, mapillary_token: str, prompt_text: 
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": "image/jpeg",
+                            "media_type": media_type,
                             "data": image_b64,
                         },
                     },
@@ -139,7 +160,7 @@ def predict_one(client: anthropic.Anthropic, mapillary_token: str, prompt_text: 
             "pred_lon": float(parsed["lon"]),
             "pred_country": parsed.get("country"),
             "confidence": parsed.get("confidence"),
-            "evidence": json.dumps(parsed.get("evidence")),
+            "evidence": parsed.get("evidence"),
             "reasoning": parsed.get("reasoning"),
         }
     except Exception as exc:
@@ -148,6 +169,14 @@ def predict_one(client: anthropic.Anthropic, mapillary_token: str, prompt_text: 
         raise PredictionParseError(f"{type(exc).__name__}: {exc}", raw_text) from exc
 
     fields["raw_response"] = raw_text
+    return fields
+
+
+def predict_one(client: anthropic.Anthropic, mapillary_token: str, prompt_text: str, row: dict) -> dict:
+    """Run one image through the model. Raises on any failure -- caller logs it."""
+    image_b64 = fetch_and_encode_image(row["image_id"], mapillary_token)
+    fields = call_model(client, prompt_text, image_b64)
+    fields["evidence"] = json.dumps(fields["evidence"])  # predictions.evidence column is TEXT
     return fields
 
 
@@ -164,6 +193,12 @@ def main() -> None:
         choices=sorted(SPLIT_CSV_PATHS),
         help="splits to combine into this run (default: dev)",
     )
+    parser.add_argument(
+        "--image-ids",
+        nargs="+",
+        default=None,
+        help="restrict to these image_ids, searched across all splits (overrides --splits filtering)",
+    )
     args = parser.parse_args()
 
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY") or load_dotenv_value("ANTHROPIC_API_KEY")
@@ -175,12 +210,31 @@ def main() -> None:
         print("MAPILLARY_TOKEN not set", file=sys.stderr)
         sys.exit(1)
 
-    split_rows = read_split_rows(args.splits)
+    if args.image_ids:
+        wanted = set(args.image_ids)
+        split_rows = [
+            (split, row) for split, row in read_split_rows(sorted(SPLIT_CSV_PATHS)) if row["image_id"] in wanted
+        ]
+        found = {row["image_id"] for _, row in split_rows}
+        missing = wanted - found
+        if missing:
+            print(f"warning: image_id(s) not found in any split: {sorted(missing)}", file=sys.stderr)
+    else:
+        split_rows = read_split_rows(args.splits)
+
     prompt_text = PROMPT_PATH.read_text()
     client = anthropic.Anthropic(api_key=anthropic_key)
 
     run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
-    run_split_label = "+".join(args.splits)
+    if args.image_ids:
+        run_split_label = "+".join(sorted({split for split, _ in split_rows}))
+        config = {"image_ids": args.image_ids, "n_rows": len(split_rows)}
+    else:
+        run_split_label = "+".join(args.splits)
+        config = {
+            "source_csvs": [str(SPLIT_CSV_PATHS[s]) for s in args.splits],
+            "n_rows": len(split_rows),
+        }
     conn = connect()
     insert_run(
         conn,
@@ -189,12 +243,7 @@ def main() -> None:
         split=run_split_label,
         model=MODEL,
         prompt_version=PROMPT_VERSION,
-        config=json.dumps(
-            {
-                "source_csvs": [str(SPLIT_CSV_PATHS[s]) for s in args.splits],
-                "n_rows": len(split_rows),
-            }
-        ),
+        config=json.dumps(config),
         n_total=len(split_rows),
     )
 
