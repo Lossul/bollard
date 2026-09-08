@@ -3,14 +3,21 @@
 One predictions.db under runs/, appended to by every run -- never overwritten,
 never rewritten in place. `score --run <id>` and `compare --runs` (not built
 yet) read from here.
+
+RUNS_DIR defaults to a local `runs/` folder for dev, but is overridable via
+BOLLARD_RUNS_DIR -- set this to a mounted persistent volume's path when
+deployed to a platform with an ephemeral container filesystem (see README >
+Deployment). webapp/rate_limit.py's counter file shares this same directory.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "runs" / "predictions.db"
+RUNS_DIR = Path(os.environ.get("BOLLARD_RUNS_DIR", Path(__file__).parent.parent / "runs"))
+DB_PATH = RUNS_DIR / "predictions.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (

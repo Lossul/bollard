@@ -3,7 +3,8 @@
 Not related to runs/predictions.db -- that database is the batch eval
 pipeline's history of scored experiments. This counts real-money calls made
 by the interactive webapp, independent of the batch runs, and survives a
-server restart (an in-memory counter wouldn't).
+server restart (an in-memory counter wouldn't) -- as long as RUNS_DIR itself
+is on storage that survives (see agent/store.py and README > Deployment).
 """
 
 from __future__ import annotations
@@ -11,9 +12,10 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 
-COUNTER_PATH = Path(__file__).parent.parent / "runs" / "webapp_daily_counter.json"
+from agent.store import RUNS_DIR
+
+COUNTER_PATH = RUNS_DIR / "webapp_daily_counter.json"
 DAILY_LIMIT = 50
 
 _lock = threading.Lock()
