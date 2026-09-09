@@ -29,14 +29,34 @@
   button:disabled { opacity: .5; cursor: not-allowed; }
   #image-wrap { text-align: center; }
   #image-wrap img { max-width: 100%; max-height: 480px; border-radius: 8px; }
-  #guess-map-wrap { position: relative; display: block; width: 100%; line-height: 0; cursor: crosshair; }
-  #guess-map-wrap img { width: 100%; display: block; border-radius: 8px; }
+  #guess-map-wrap {
+    position: relative; width: 100%; aspect-ratio: 2 / 1; overflow: hidden;
+    border-radius: 8px; cursor: crosshair; touch-action: none; background: var(--bg);
+  }
+  #guess-map-wrap.dragging { cursor: grabbing; }
+  #guess-map-content {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    transform-origin: 0 0; will-change: transform;
+  }
+  #guess-map-content img {
+    width: 100%; height: 100%; display: block; -webkit-user-drag: none;
+    -webkit-user-select: none; user-select: none;
+  }
   #guess-pin {
     position: absolute; width: 14px; height: 14px; margin-left: -8px; margin-top: -8px;
     background: var(--accent); border: 2px solid #fff; border-radius: 50%;
     box-shadow: 0 1px 3px rgba(0,0,0,.5); pointer-events: none;
   }
   #guess-pin[hidden] { display: none; }
+  .map-zoom-controls {
+    position: absolute; top: 10px; left: 10px; z-index: 2;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .map-zoom-controls button {
+    width: 28px; height: 28px; padding: 0; line-height: 1; font-size: 16px;
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    box-shadow: 0 1px 2px rgba(0,0,0,.2);
+  }
   .map-credit { font-size: 11px; color: var(--muted); margin-top: 6px; text-align: right; }
   #guess-coords { font-size: 12.5px; color: var(--muted); }
   .guess-hint { margin-bottom: 8px; }
@@ -74,10 +94,16 @@
   </div>
 
   <div class="panel">
-    <div class="sub guess-hint">Click the map where you think the photo was taken.</div>
+    <div class="sub guess-hint">Click the map where you think the photo was taken. Scroll or drag to zoom and pan.</div>
     <div id="guess-map-wrap">
-      <img id="guess-map" src="/static/world_map.jpg" alt="World map -- click to place your guess">
-      <div id="guess-pin" hidden></div>
+      <div class="map-zoom-controls">
+        <button type="button" id="guess-zoom-in" title="Zoom in">+</button>
+        <button type="button" id="guess-zoom-out" title="Zoom out">&minus;</button>
+      </div>
+      <div id="guess-map-content">
+        <img id="guess-map" src="/static/world_map.jpg" alt="World map -- click to place your guess" draggable="false">
+        <div id="guess-pin" hidden></div>
+      </div>
     </div>
     <div class="map-credit">Map: Strebe, CC BY-SA 3.0, via Wikimedia Commons</div>
   </div>
@@ -104,9 +130,11 @@
   const imageWrap = document.getElementById("image-wrap");
   const roundImage = document.getElementById("round-image");
   const guessMapWrap = document.getElementById("guess-map-wrap");
-  const guessMap = document.getElementById("guess-map");
+  const guessMapContent = document.getElementById("guess-map-content");
   const guessPin = document.getElementById("guess-pin");
   const guessCoords = document.getElementById("guess-coords");
+  const guessZoomInBtn = document.getElementById("guess-zoom-in");
+  const guessZoomOutBtn = document.getElementById("guess-zoom-out");
   const revealBtn = document.getElementById("reveal-btn");
   const resultsEl = document.getElementById("results");
   const resultsTextEl = document.getElementById("results-text");
@@ -121,22 +149,143 @@
     return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
 
-  // Static map is a plain equirectangular projection: pixel fraction maps
-  // linearly onto lon in [-180, 180] and lat in [90, -90].
-  guessMapWrap.addEventListener("click", (e) => {
-    if (!currentRound) return;
-    const rect = guessMap.getBoundingClientRect();
-    const fracX = (e.clientX - rect.left) / rect.width;
-    const fracY = (e.clientY - rect.top) / rect.height;
-    const lat = 90 - fracY * 180;
-    const lon = fracX * 360 - 180;
+  // Zoom/pan state for the guess map. The map image + pin live in
+  // #guess-map-content, which gets `translate(panX,panY) scale(zoom)`
+  // (transform-origin: 0 0) inside the fixed-size, overflow:hidden viewport
+  // #guess-map-wrap. Because the pin is a child of that same transformed
+  // element, it tracks the map automatically on pan/zoom -- no repositioning
+  // needed once placed.
+  let zoom = 1;
+  let panX = 0;
+  let panY = 0;
+  const ZOOM_MIN = 1;
+  const ZOOM_MAX = 10;
 
+  function applyGuessMapTransform() {
+    guessMapContent.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  }
+
+  // Keeps the viewport fully covered by the (possibly zoomed) image, which
+  // also guarantees screenToLatLon below always resolves to a fraction in
+  // [0, 1] for any click inside the viewport, at any zoom/pan.
+  function clampGuessMapPan() {
+    const rect = guessMapWrap.getBoundingClientRect();
+    const contentWidth = rect.width * zoom;
+    const contentHeight = rect.height * zoom;
+    panX = Math.min(0, Math.max(rect.width - contentWidth, panX));
+    panY = Math.min(0, Math.max(rect.height - contentHeight, panY));
+  }
+
+  function resetGuessMapView() {
+    zoom = 1;
+    panX = 0;
+    panY = 0;
+    applyGuessMapTransform();
+  }
+
+  function zoomGuessMapAt(cursorX, cursorY, factor) {
+    const newZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom * factor));
+    const actualFactor = newZoom / zoom;
+    // Keep the point under the cursor stationary on screen while zooming.
+    panX = cursorX - (cursorX - panX) * actualFactor;
+    panY = cursorY - (cursorY - panY) * actualFactor;
+    zoom = newZoom;
+    clampGuessMapPan();
+    applyGuessMapTransform();
+  }
+
+  guessMapWrap.addEventListener(
+    "wheel",
+    (e) => {
+      if (!currentRound) return;
+      e.preventDefault();
+      const rect = guessMapWrap.getBoundingClientRect();
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      zoomGuessMapAt(e.clientX - rect.left, e.clientY - rect.top, factor);
+    },
+    { passive: false }
+  );
+
+  guessZoomInBtn.addEventListener("click", () => {
+    const rect = guessMapWrap.getBoundingClientRect();
+    zoomGuessMapAt(rect.width / 2, rect.height / 2, 1.5);
+  });
+  guessZoomOutBtn.addEventListener("click", () => {
+    const rect = guessMapWrap.getBoundingClientRect();
+    zoomGuessMapAt(rect.width / 2, rect.height / 2, 1 / 1.5);
+  });
+
+  window.addEventListener("resize", () => {
+    clampGuessMapPan();
+    applyGuessMapTransform();
+  });
+
+  // Static map is a plain equirectangular projection: pixel fraction maps
+  // linearly onto lon in [-180, 180] and lat in [90, -90] -- inverting the
+  // current pan/zoom transform first to get back to that pixel fraction.
+  function screenToLatLon(clientX, clientY) {
+    const rect = guessMapWrap.getBoundingClientRect();
+    const fracX = (clientX - rect.left - panX) / (zoom * rect.width);
+    const fracY = (clientY - rect.top - panY) / (zoom * rect.height);
+    return { lat: 90 - fracY * 180, lon: fracX * 360 - 180, fracX, fracY };
+  }
+
+  function placeGuessAt(clientX, clientY) {
+    const { lat, lon, fracX, fracY } = screenToLatLon(clientX, clientY);
     userGuess = { lat, lon };
     guessPin.style.left = `${fracX * 100}%`;
     guessPin.style.top = `${fracY * 100}%`;
     guessPin.hidden = false;
     guessCoords.textContent = `your guess: ${lat.toFixed(2)}, ${lon.toFixed(2)}`;
     revealBtn.disabled = false;
+  }
+
+  // Click-vs-drag: a pointerdown followed by movement beyond a small
+  // threshold pans the map instead of placing a guess.
+  let dragState = null;
+  const DRAG_THRESHOLD_PX = 4;
+
+  guessMapWrap.addEventListener("pointerdown", (e) => {
+    if (!currentRound || e.target.closest(".map-zoom-controls")) return;
+    guessMapWrap.setPointerCapture(e.pointerId);
+    dragState = {
+      pointerId: e.pointerId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      startPanX: panX,
+      startPanY: panY,
+      moved: false,
+    };
+  });
+
+  guessMapWrap.addEventListener("pointermove", (e) => {
+    if (!dragState || e.pointerId !== dragState.pointerId) return;
+    const dx = e.clientX - dragState.startClientX;
+    const dy = e.clientY - dragState.startClientY;
+    if (!dragState.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD_PX) {
+      dragState.moved = true;
+      guessMapWrap.classList.add("dragging");
+    }
+    if (dragState.moved) {
+      panX = dragState.startPanX + dx;
+      panY = dragState.startPanY + dy;
+      clampGuessMapPan();
+      applyGuessMapTransform();
+    }
+  });
+
+  function endGuessMapDrag(e) {
+    if (!dragState || e.pointerId !== dragState.pointerId) return;
+    const wasDrag = dragState.moved;
+    guessMapWrap.classList.remove("dragging");
+    dragState = null;
+    if (!wasDrag) placeGuessAt(e.clientX, e.clientY);
+  }
+
+  guessMapWrap.addEventListener("pointerup", endGuessMapDrag);
+  guessMapWrap.addEventListener("pointercancel", () => {
+    dragState = null;
+    guessMapWrap.classList.remove("dragging");
   });
 
   function showError(msg) {
@@ -168,6 +317,7 @@
     guessPin.hidden = true;
     guessCoords.textContent = "no guess placed yet";
     revealBtn.disabled = true;
+    resetGuessMapView();
     resultsEl.classList.remove("visible");
     resultsTextEl.innerHTML = "";
     clearMap();
